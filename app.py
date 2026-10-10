@@ -170,10 +170,20 @@ def excel_export(df, quality, nationality, cro, daily, forecast, risk, ai_summar
     return buff.getvalue()
 
 
-def get_ai_summary(df, quality, nationality, cro, forecast_summary):
+def get_api_key():
     key = os.getenv("OPENROUTER_API_KEY")
+    if key:
+        return key
+    try:
+        return st.secrets["OPENROUTER_API_KEY"]
+    except (KeyError, FileNotFoundError):
+        return None
+
+
+def get_ai_summary(df, quality, nationality, cro, forecast_summary):
+    key = get_api_key()
     if not key:
-        return "OpenRouter key not found. Set OPENROUTER_API_KEY in the same terminal before launching Streamlit. The deterministic analytics and Excel export still work."
+        return "OpenRouter key not found. Set OPENROUTER_API_KEY in your terminal or configure it in Streamlit Secrets. The deterministic analytics and Excel export still work."
     model = st.session_state.get("model_id", "openai/gpt-4o-mini")
     client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=key, timeout=90, max_retries=2)
     data = {
@@ -203,6 +213,118 @@ def get_ai_summary(df, quality, nationality, cro, forecast_summary):
         temperature=0.2,
     )
     return response.choices[0].message.content or "The model returned no summary."
+
+
+
+def chatbot_tool_data(df, nationality, cro, daily, quality):
+    """Expose deterministic, dataset-grounded functions to the LLM agent."""
+    d = analysis_copy(df)
+    apps = float(d["Applications"].sum())
+    pays = float(d["Payments"].sum())
+    visa_sub = float(d["Visa_Submissions"].sum())
+    visa_approved = float(d["Visa_Approvals"].sum())
+    pending = float(d["Commission_Pending"].sum())
+
+    def kpi_summary():
+        return {
+            "records": int(len(d)),
+            "date_range": [str(d["Date"].min()), str(d["Date"].max())],
+            "applications": apps,
+            "payments": pays,
+            "payment_conversion": pays / apps if apps else None,
+            "visa_submissions": visa_sub,
+            "visa_submission_rate_vs_applications": visa_sub / apps if apps else None,
+            "visa_approvals": visa_approved,
+            "visa_approval_rate_vs_submissions": visa_approved / visa_sub if visa_sub else None,
+            "pending_commissions": pending,
+        }
+
+    def nationality_metrics():
+        cols = ["Nationality", "Applications", "Payments", "Payment_Conversion", "Visa_Submissions", "Visa_Approvals", "Visa_Approval_Rate", "Visa_Risk_Flag", "Approval_Rate_Over_100_Flag"]
+        return nationality[cols].sort_values("Payment_Conversion", ascending=False).replace({float("nan"): None}).to_dict(orient="records")
+
+    def cro_metrics():
+        cols = ["CRO_ID", "Applications", "Payments", "Payment_Conversion", "Visa_Submissions", "Visa_Approvals", "Commission_Pending", "KPI_Status", "Records"]
+        return cro[cols].sort_values("Payment_Conversion", ascending=False).to_dict(orient="records")
+
+    def daily_metrics(start_date=None, end_date=None):
+        x = daily.copy()
+        if start_date:
+            x = x[x["Date"] >= pd.to_datetime(start_date, errors="coerce")]
+        if end_date:
+            x = x[x["Date"] <= pd.to_datetime(end_date, errors="coerce")]
+        x["Date"] = x["Date"].astype(str)
+        return x.to_dict(orient="records")
+
+    def quality_issues():
+        violations = d[(d["Payments"] > d["Applications"]) | (d["Visa_Submissions"] > d["Payments"]) | (d["Visa_Approvals"] > d["Visa_Submissions"])]
+        cols = ["Date", "Nationality", "Applications", "Payments", "Visa_Submissions", "Visa_Approvals", "CRO_ID"]
+        return {
+            "quality_checks": quality.to_dict(orient="records"),
+            "funnel_violation_rows": violations[cols].assign(Date=violations["Date"].astype(str)).to_dict(orient="records"),
+            "note": "Do not silently correct these records. Verify source definitions and CRM records with the business owner."
+        }
+
+    return {
+        "get_kpi_summary": kpi_summary,
+        "get_nationality_metrics": nationality_metrics,
+        "get_cro_metrics": cro_metrics,
+        "get_daily_metrics": daily_metrics,
+        "get_data_quality_issues": quality_issues,
+    }
+
+
+def run_dataset_chat(question, history, df, nationality, cro, daily, quality, model):
+    key = get_api_key()
+    if not key:
+        raise RuntimeError("OpenRouter key is missing. Configure OPENROUTER_API_KEY in Streamlit Secrets for the deployed app.")
+    client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=key, timeout=90, max_retries=2)
+    funcs = chatbot_tool_data(df, nationality, cro, daily, quality)
+    tool_specs = [
+        {"type": "function", "function": {"name": "get_kpi_summary", "description": "Get overall dataset totals, date range, conversion and pending commissions.", "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}},
+        {"type": "function", "function": {"name": "get_nationality_metrics", "description": "Get application/payment conversion and visa approval rates by nationality, including risk flags.", "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}},
+        {"type": "function", "function": {"name": "get_cro_metrics", "description": "Get applications, payments, conversion, pending commission and KPI status by CRO.", "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}},
+        {"type": "function", "function": {"name": "get_daily_metrics", "description": "Get daily KPI records, optionally filtered by inclusive ISO dates YYYY-MM-DD.", "parameters": {"type": "object", "properties": {"start_date": {"type": "string", "description": "Optional inclusive start date YYYY-MM-DD"}, "end_date": {"type": "string", "description": "Optional inclusive end date YYYY-MM-DD"}}, "additionalProperties": False}}},
+        {"type": "function", "function": {"name": "get_data_quality_issues", "description": "Inspect missing values, duplicates and impossible funnel-order relationships such as payments exceeding applications.", "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}},
+    ]
+    system = (
+        "You are the EdTech Sales Operations Dataset Chatbot. Answer questions using the uploaded dataset only. "
+        "Call the relevant tools to retrieve exact figures before answering. Never invent figures or imply correlation is causation. "
+        "Definitions: payment conversion = payments / applications; visa submission rate = visa submissions / applications; "
+        "visa approval rate = visa approvals / visa submissions; CRO benchmark is payment conversion >20%; visa-risk threshold is approval rate <60%. "
+        "If a visa approval rate exceeds 100%, flag it as a data-quality issue, not exceptional performance. Do not silently correct source records. "
+        "The file contains March 2026 observations only, so do not claim a validated seasonal forecast. Clearly distinguish calculated values from recommendations. "
+        "Be concise, show formulas where useful, and use tables for comparisons."
+    )
+    messages = [{"role": "system", "content": system}]
+    for item in history[-8:]:
+        if item.get("role") in ("user", "assistant") and isinstance(item.get("content"), str):
+            messages.append({"role": item["role"], "content": item["content"]})
+    messages.append({"role": "user", "content": question})
+    for _ in range(5):
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=tool_specs,
+            tool_choice="auto",
+            temperature=0.1,
+        )
+        message = response.choices[0].message
+        if not message.tool_calls:
+            return message.content or "I couldn't generate a response. Please try asking a more specific question."
+        messages.append({"role": "assistant", "content": message.content, "tool_calls": [tc.model_dump(exclude_none=True) for tc in message.tool_calls]})
+        for tc in message.tool_calls:
+            name = tc.function.name
+            if name not in funcs:
+                result = {"error": "Unknown tool"}
+            else:
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                    result = funcs[name](**args)
+                except Exception as exc:
+                    result = {"error": str(exc)}
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result, default=str)})
+    return "I reached the analysis step limit. Please ask a narrower question."
 
 
 uploaded = st.file_uploader("Upload sales workbook (.xlsx) or CSV", type=["xlsx", "csv"])
@@ -239,7 +361,7 @@ k3.metric("Payment conversion", f"{payments/apps:.1%}" if apps else "N/A")
 k4.metric("Visa submission / applications", f"{visa_rate:.1%}" if apps else "N/A")
 k5.metric("Pending commissions", f"{commission:,.0f}")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["Daily KPIs", "Nationality & Visa Risk", "CRO & Commissions", "Forecast", "Data Quality & AI Summary"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Daily KPIs", "Nationality & Visa Risk", "CRO & Commissions", "Forecast", "Data Quality & AI Summary", "Dataset Chatbot"])
 
 with tab1:
     st.subheader("Daily pipeline")
@@ -320,3 +442,35 @@ st.download_button(
     file_name="EdTech_Sales_Operations_Report.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
+
+
+with tab6:
+    st.subheader("Ask questions about your sales dataset")
+    st.caption("The chatbot uses Python analytical tools to retrieve figures from this workbook before composing an answer with OpenRouter.")
+    st.markdown("Try: **Which CRO has the highest conversion?** · **Which nationalities are below the 60% visa approval threshold?** · **Show the data-quality issues.** · **What are total pending commissions?**")
+    if "dataset_chat_history" not in st.session_state:
+        st.session_state["dataset_chat_history"] = []
+    for chat_item in st.session_state["dataset_chat_history"]:
+        with st.chat_message(chat_item["role"]):
+            st.markdown(chat_item["content"])
+    user_question = st.chat_input("Ask a question about applications, payments, CROs, visas, or commissions…", key="dataset_chat_input")
+    if user_question:
+        st.session_state["dataset_chat_history"].append({"role": "user", "content": user_question})
+        with st.chat_message("user"):
+            st.markdown(user_question)
+        with st.chat_message("assistant"):
+            with st.spinner("Checking the dataset and preparing an answer..."):
+                try:
+                    answer = run_dataset_chat(
+                        user_question,
+                        st.session_state["dataset_chat_history"][:-1],
+                        d, nationality, cro, daily, quality,
+                        st.session_state.get("model_id", "openai/gpt-4o-mini")
+                    )
+                    st.markdown(answer)
+                    st.session_state["dataset_chat_history"].append({"role": "assistant", "content": answer})
+                except Exception as exc:
+                    st.error(f"Chatbot request failed: {exc}")
+    if st.button("Clear chatbot conversation"):
+        st.session_state["dataset_chat_history"] = []
+        st.rerun()
